@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "build": "uglifyjs sgw-loader.js -o sgw-loader.min.js --mangle"
+  },
+  "devDependencies": {
+    "stape-gtm-api-types": "^0.1.2",
+    "uglify-js": "^3.19.3"
+  }
+}

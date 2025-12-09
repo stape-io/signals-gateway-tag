@@ -17,7 +17,6 @@ Learn more: [Signals Gateway](https://developers.facebook.com/docs/marketing-api
 7. (Optional) Configure **Consent Settings** using either GTM Consent Mode or manual control.
 8.  (Optional) Activate **Limited Data Use (LDU)** for California data compliance and specify Country/State codes.
 9.  (Optional) Enable **Server-Side Tracking Support** using Event ID and Data Layer push for deduplication with Conversions API or Signals Gateway Pixel.
-10. Adjust **Settings** for automatic configuration (automatic events collection, such as button clicks and page metadata capture) and history event tracking (mainly for SPA websites).
 
 ## Event Name Setup Options
 
@@ -73,11 +72,6 @@ Send additional metadata via:
 
 Includes support for:
 - `value`, `currency`, `content_ids`, `contents`, `num_items`, and others depending on ecommerce format.
-
-### Other Settings
-
-- Disable automatic `cbq('set','autoConfig')`, which disables automatic events such as button clicks and page metadata capture.
-- Disable PageView automatic tracking on SPA websites.
 
 ## Open Source
 
