@@ -1,0 +1,5 @@
+homepage: 'https://stape.io/'
+documentation: 'https://github.com/stape-io/signals-gateway-tag'
+versions:
+  - sha: 1e32c9ee01465d9032479b48129ac66cb75b70e3
+    changeNotes: Initial release.
