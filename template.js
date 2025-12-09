@@ -14,6 +14,7 @@ const makeString = require('makeString');
 const makeTableMap = require('makeTableMap');
 const math = require('Math');
 const Object = require('Object');
+const parseUrl = require('parseUrl');
 const setInWindow = require('setInWindow');
 const sha256 = require('sha256');
 
@@ -25,7 +26,7 @@ const queueName = 'cbq';
 const queue = getQueue(queueName);
 
 setConsent(data, queue);
-sendEvent(data, queue, queueName);
+sendEvent(data, queue);
 sendDataLayerPush(data);
 loadScripts(data);
 
@@ -75,13 +76,16 @@ function setConsent(data, queue) {
   queue('consent', data.consent === false ? 'revoke' : 'grant');
 }
 
-function sendEvent(data, queue, queueName) {
+function sendEvent(data, queue) {
   const eventName = getEventName(data);
   const command = getCommand(eventName);
   const eventData = getEventData(data, eventName);
   const userData = getUserData(data);
   const eventId = data.eventId;
-  const pixelId = data.signalsPixelId;
+
+  const signalsPixelConfig = getSignalsPixelConfig(data);
+  const signalsPixelHost = signalsPixelConfig.signalsPixelHost;
+  const pixelId = signalsPixelConfig.signalsPixelId;
 
   const initIdsGlobalVariableName = '_meta_gtm_signals_gateway_ids';
   const initIds = copyFromWindow(initIdsGlobalVariableName) || {};
@@ -90,14 +94,12 @@ function sendEvent(data, queue, queueName) {
   if (isPixelIdNotInitialized) {
     initIds[pixelId] = true;
     setInWindow(initIdsGlobalVariableName, initIds, true);
-    queue('setHost', data.signalsPixelHost);
+    queue('setHost', signalsPixelHost);
     // .toString is a way to circuvemnt the current impossility of setting a string on 'integrationMethod'.
     queue('set', 'integrationMethod', { toString: () => partnerName });
   }
 
   if (isPixelIdNotInitialized || (data.enableAdvancedMatching && !data.runInitOnce)) queue('init', pixelId, userData);
-  // Loads the Signals Pixel ID configuration if the Signals Pixel Script URL does not contain this Pixel ID.
-  if (data.signalsPixelScriptURL.indexOf(pixelId) === -1) queue('loadConfig', pixelId);
   queue(command, pixelId, eventName, eventData, eventId ? { eventID: eventId } : undefined);
 }
 
@@ -329,6 +331,25 @@ function storeEventEnhancement(data, userData) {
     if (!data.storeUserDataHashed) storeUserDataInLocalStorage(userData);
     else hashUserDataFields(userData, storeUserDataInLocalStorage);
   }
+}
+
+function getSignalsPixelConfig(data) {
+  const parsedScriptUrl = parseUrl(data.signalsPixelScriptURL);
+  const signalsPixelHostFromUrl = parsedScriptUrl.origin + '/';
+  const signalsPixelIdFromUrl = parsedScriptUrl.pathname.split('/').filter((e) => e && e.match('^[1-9][0-9]+'))[0];
+
+  let signalsPixelHostFromUI;
+  if (getType(data.signalsPixelHost) === 'string') {
+    signalsPixelHostFromUI =
+      data.signalsPixelHost.charAt(data.signalsPixelHost.length - 1) !== '/'
+        ? data.signalsPixelHost + '/'
+        : data.signalsPixelHost;
+  }
+
+  return {
+    signalsPixelHost: signalsPixelHostFromUI || signalsPixelHostFromUrl,
+    signalsPixelId: data.signalsPixelId || signalsPixelIdFromUrl
+  };
 }
 
 function sendDataLayerPush(data) {

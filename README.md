@@ -26,8 +26,6 @@ Learn more: [Signals Gateway](https://developers.facebook.com/docs/marketing-api
   - Maps GA4 events like `purchase`, `add_to_cart`, `sign_up`, etc. to Meta equivalents.
 
 ## Required Fields
-- **Signals Gateway Pixel ID**
-- **Signals Gateway Pixel Host**
 - **Signals Gateway Pixel Script URL**
 
 ## Features
