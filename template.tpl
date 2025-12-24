@@ -57,7 +57,8 @@ ___TEMPLATE_PARAMETERS___
             ]
           }
         ],
-        "valueHint": "https://sgw.example.com/sdk/123456789/events.js"
+        "valueHint": "https://sgw.example.com/sdk/123456789/events.js",
+        "alwaysInSummary": true
       },
       {
         "type": "SELECT",
@@ -196,7 +197,8 @@ ___TEMPLATE_PARAMETERS___
             "displayName": "Event Type"
           }
         ],
-        "defaultValue": "override"
+        "defaultValue": "override",
+        "alwaysInSummary": true
       },
       {
         "type": "CHECKBOX",
@@ -221,7 +223,8 @@ ___TEMPLATE_PARAMETERS___
               }
             ]
           }
-        ]
+        ],
+        "alwaysInSummary": true
       },
       {
         "type": "CHECKBOX",
@@ -256,7 +259,8 @@ ___TEMPLATE_PARAMETERS___
                     ]
                   }
                 ],
-                "defaultValue": true
+                "defaultValue": true,
+                "alwaysInSummary": true
               },
               {
                 "type": "CHECKBOX",
@@ -275,7 +279,8 @@ ___TEMPLATE_PARAMETERS___
             ]
           }
         ],
-        "defaultValue": true
+        "defaultValue": true,
+        "alwaysInSummary": true
       }
     ]
   },
