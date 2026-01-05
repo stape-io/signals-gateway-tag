@@ -1,6 +1,8 @@
 homepage: 'https://stape.io/'
 documentation: 'https://github.com/stape-io/signals-gateway-tag'
 versions:
+  - sha: 45e444578be2400d46993b7bc3a59fda7872940e
+    changeNotes: Updated tag icon.
   - sha: e9d5ad6e36baaa73e968c63b07d33499dfe8e220
     changeNotes: Forced configuration fields to be displayed in UI when the tag is in summary view.
   - sha: 59d1c239f04ee9abab5b962f3788a9c4c1b0df46
