@@ -71,6 +71,10 @@ Send additional metadata via:
 Includes support for:
 - `value`, `currency`, `content_ids`, `contents`, `num_items`, and others depending on ecommerce format.
 
+## Useful Resources
+
+- [What is Signals Gateway & Setup Guide](https://stape.io/blog/what-is-signals-gateway)
+
 ## Open Source
 
 The **Signals Gateway Pixel by Stape** tag for GTM Web is developed and maintained by the [Stape Team](https://stape.io/) under the Apache 2.0 license.
