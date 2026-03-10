@@ -651,7 +651,7 @@ const localStorage = require('localStorage');
 const makeNumber = require('makeNumber');
 const makeString = require('makeString');
 const makeTableMap = require('makeTableMap');
-const math = require('Math');
+const Math = require('Math');
 const Object = require('Object');
 const parseUrl = require('parseUrl');
 const setInWindow = require('setInWindow');
@@ -660,7 +660,7 @@ const sha256 = require('sha256');
 /*==============================================================================
 ==============================================================================*/
 
-const partnerName = 'stape-gtm-1.0.0-sgw';
+const partnerName = 'stape-gtm-1.0.1-sgw';
 const queueName = 'cbq';
 const queue = getQueue(queueName);
 
@@ -734,8 +734,7 @@ function sendEvent(data, queue) {
     initIds[pixelId] = true;
     setInWindow(initIdsGlobalVariableName, initIds, true);
     queue('setHost', signalsPixelHost);
-    // .toString is a way to circuvemnt the current impossility of setting a string on 'integrationMethod'.
-    queue('set', 'integrationMethod', { toString: () => partnerName });
+    queue('set', 'integrationMethod', partnerName);
   }
 
   if (isPixelIdNotInitialized || (data.enableAdvancedMatching && !data.runInitOnce)) queue('init', pixelId, userData);
@@ -868,11 +867,13 @@ function getEventData(data, eventName) {
   let objectProperties = {};
 
   if (data.enableDataLayerMapping) {
-    const ecommerce = getDL('ecommerce');
-
-    if (ecommerce) {
-      objectProperties = getUAEventData(eventName, objectProperties, ecommerce);
+    let ecommerce = getDL('ecommerce');
+    if (getType(ecommerce) !== 'object') {
+      ecommerce = {};
     }
+
+    objectProperties = getUAEventData(eventName, objectProperties, ecommerce);
+
     if (!objectProperties.content_type) {
       objectProperties = getGA4EventData(eventName, objectProperties, ecommerce);
     }
@@ -1100,7 +1101,7 @@ function getUAEventData(eventName, objectProperties, ecommerce) {
         })),
         content_ids: ecommerce[action].products.map((prod) => prod.id),
         value: ecommerce[action].products.reduce((acc, cur) => {
-          const curVal = math.round(makeNumber(cur.price || 0) * (cur.quantity || 1) * 100) / 100;
+          const curVal = Math.round(makeNumber(cur.price || 0) * (cur.quantity || 1) * 100) / 100;
           return acc + curVal;
         }, 0.0),
         currency: ecommerce.currencyCode || 'USD'
@@ -1117,10 +1118,7 @@ function getUAEventData(eventName, objectProperties, ecommerce) {
 }
 
 function getGA4EventData(eventName, objectProperties, ecommerce) {
-  let items = getDL('items');
-  if (!items && ecommerce && ecommerce.items) {
-    items = ecommerce.items;
-  }
+  const items = getDL('items') || ecommerce.items;
   let currencyFromItems = '';
   let valueFromItems = 0;
 
@@ -1140,13 +1138,13 @@ function getGA4EventData(eventName, objectProperties, ecommerce) {
         objectProperties.value = items[0].quantity ? items[0].quantity * items[0].price : items[0].price;
     }
 
-    items.forEach((d, i) => {
+    items.forEach((d) => {
       const content = {};
       if (d.item_id) content.id = d.item_id;
       content.quantity = makeNumber(d.quantity) || 1;
 
       if (d.price) {
-        let item_price = makeNumber(d.price);
+        const item_price = makeNumber(d.price);
         valueFromItems += d.quantity ? d.quantity * item_price : item_price;
         content.item_price = item_price;
       }
@@ -1159,12 +1157,14 @@ function getGA4EventData(eventName, objectProperties, ecommerce) {
     });
   }
 
-  if (getDL('value')) objectProperties.value = getDL('value');
+  const value = ecommerce.value || valueFromItems || getDL('value');
+  if (value) objectProperties.value = value;
 
-  if (getDL('currency')) objectProperties.currency = getDL('currency');
-  else if (currencyFromItems) objectProperties.currency = currencyFromItems;
+  const currency = ecommerce.currency || currencyFromItems || getDL('currency');
+  if (currency) objectProperties.currency = currency;
 
-  if (getDL('search_term')) objectProperties.search_string = getDL('search_term');
+  const searchTerm = getDL('search_term');
+  if (searchTerm) objectProperties.search_string = searchTerm;
 
   if (eventName === 'Purchase') {
     if (!objectProperties.currency) objectProperties.currency = 'USD';
