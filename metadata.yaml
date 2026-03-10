@@ -1,6 +1,8 @@
 homepage: 'https://stape.io/'
 documentation: 'https://github.com/stape-io/signals-gateway-tag'
 versions:
+  - sha: 6bda58950f4f778ffe2f7004f1385e59daf83755
+    changeNotes: Updated auto-mapping from dataLayer for items, value and currency. Removed workaround to set integrationMethod parameter after SDK update.
   - sha: 45e444578be2400d46993b7bc3a59fda7872940e
     changeNotes: Updated tag icon.
   - sha: e9d5ad6e36baaa73e968c63b07d33499dfe8e220
