@@ -1,6 +1,8 @@
 homepage: 'https://stape.io/'
 documentation: 'https://github.com/stape-io/signals-gateway-tag'
 versions:
+  - sha: 20ec87f6be3e019608fd35a576dfb7d089baeece
+    changeNotes: Fixed typo in Consent settings URL help text.
   - sha: 6bda58950f4f778ffe2f7004f1385e59daf83755
     changeNotes: Updated auto-mapping from dataLayer for items, value and currency. Removed workaround to set integrationMethod parameter after SDK update.
   - sha: 45e444578be2400d46993b7bc3a59fda7872940e
