@@ -306,7 +306,7 @@ ___TEMPLATE_PARAMETERS___
           }
         ],
         "simpleValueType": true,
-        "help": "Setting Consent Granted to \u003cstrong\u003efalse\u003c/strong\u003e will prevent the pixel from sending hits until tag fired with Consent Granted \u003cstrong\u003etrue\u003c/strong\u003e.\n\u003cbr/\u003e\n\u003ca href\u003d\"hhttps://developers.facebook.com/docs/meta-pixel/implementation/gdpr\"\u003eLearn more\u003c/a\u003e.",
+        "help": "Setting Consent Granted to \u003cstrong\u003efalse\u003c/strong\u003e will prevent the pixel from sending hits until tag fired with Consent Granted \u003cstrong\u003etrue\u003c/strong\u003e.\n\u003cbr/\u003e\n\u003ca href\u003d\"https://developers.facebook.com/docs/meta-pixel/implementation/gdpr\"\u003eLearn more\u003c/a\u003e.",
         "enablingConditions": [
           {
             "paramName": "enableConsentMode",
