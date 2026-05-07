@@ -78,3 +78,6 @@ Includes support for:
 ## Open Source
 
 The **Signals Gateway Pixel by Stape** tag for GTM Web is developed and maintained by the [Stape Team](https://stape.io/) under the Apache 2.0 license.
+
+### GTM Gallery Status
+🟢 [Listed](https://tagmanager.google.com/gallery/#/owners/stape-io/templates/signals-gateway-tag)
