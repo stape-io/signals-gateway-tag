@@ -544,7 +544,7 @@ ___TEMPLATE_PARAMETERS___
           {
             "type": "CHECKBOX",
             "name": "dataLayerEventPush",
-            "checkboxText": "Push event to DataLayer with this eventId",
+            "checkboxText": "Push event to DataLayer with this Event ID",
             "simpleValueType": true,
             "help": "Helpful for easier events deduplication.",
             "defaultValue": false
@@ -656,18 +656,40 @@ const Object = require('Object');
 const parseUrl = require('parseUrl');
 const setInWindow = require('setInWindow');
 const sha256 = require('sha256');
+const templateStorage = require('templateStorage');
+
+// Call-once methods.
+let gtmOnSuccess = () => {
+  gtmOnSuccess = () => {};
+  return data.gtmOnSuccess();
+};
+
+let gtmOnFailure = () => {
+  gtmOnFailure = () => {};
+  return data.gtmOnFailure();
+};
 
 /*==============================================================================
 ==============================================================================*/
 
-const partnerName = 'stape-gtm-1.0.1-sgw';
+const partnerName = 'stape-gtm-1.0.2-sgw';
 const queueName = 'cbq';
 const queue = getQueue(queueName);
+const isConsentRevoked = data.enableConsentMode
+  ? !isConsentGranted('ad_storage')
+  : data.consent === false;
 
-setConsent(data, queue);
-sendEvent(data, queue);
+setConsent(data, isConsentRevoked);
+sendEvent(data, queue, isConsentRevoked);
 sendDataLayerPush(data);
-loadScripts(data);
+runOnConsentGranted('ad_storage', isConsentRevoked, () => {
+  loadScripts(data);
+});
+
+if (isConsentRevoked) {
+  // If consent is revoked, call gtmOnSuccess to avoid 'Still running' status.
+  return gtmOnSuccess();
+}
 
 /*==============================================================================
   Vendor related functions
@@ -689,37 +711,63 @@ function getQueue(queueName) {
   return copyFromWindow(queueName);
 }
 
-function setConsent(data, queue) {
+function setCbqConsent(command) {
+  const q = getQueue(queueName);
+  if (command === 'revoke') {
+    // Allows only one 'revoke' command at a time in the queue to avoid it being locked indefinitely.
+    const queueHasRevokeCommand = (q.queue || []).some(
+      (item) => item[0] === 'consent' && item[1] === 'revoke'
+    );
+    if (queueHasRevokeCommand) return;
+  }
+  q('consent', command);
+}
+
+function runOnConsentGranted(consentType, isConsentRevoked, callback) {
+  if (data.enableConsentMode) {
+    if (isConsentRevoked) {
+      const callbacksKey = 'cbq_consent_callbacks_' + consentType;
+      const callbacks = templateStorage.getItem(callbacksKey) || [];
+      callbacks.push(callback);
+      templateStorage.setItem(callbacksKey, callbacks);
+
+      const listenerAddedKey = 'cbq_consent_listener_added_' + consentType;
+      if (!templateStorage.getItem(listenerAddedKey)) {
+        templateStorage.setItem(listenerAddedKey, true);
+        addConsentListener(consentType, (type, granted) => {
+          if (type !== consentType || !granted) return;
+          const queuedCallbacks = templateStorage.getItem(callbacksKey) || [];
+          templateStorage.setItem(callbacksKey, []);
+          queuedCallbacks.forEach((cb) => cb());
+        });
+      }
+    } else {
+      callback();
+    }
+    return;
+  }
+
+  // Manual consent
+  if (!isConsentRevoked) callback();
+}
+
+function setConsent(data, isConsentRevoked) {
   if (data.dpoLDU) {
     queue('dataProcessingOptions', ['LDU'], makeNumber(data.dpoCountry), makeNumber(data.dpoState));
   }
 
-  if (data.enableConsentMode) {
-    if (!isConsentGranted('ad_storage')) {
-      queue('consent', 'revoke');
+  if (isConsentRevoked) setCbqConsent('revoke');
 
-      let wasCalled = false;
-      addConsentListener('ad_storage', (consentType, granted) => {
-        if (wasCalled || consentType !== 'ad_storage' || !granted) return;
-        wasCalled = true;
-        queue('consent', 'grant');
-      });
-
-      return;
-    }
-
-    queue('consent', 'grant');
-    return;
-  }
-
-  queue('consent', data.consent === false ? 'revoke' : 'grant');
+  runOnConsentGranted('ad_storage', isConsentRevoked, () => {
+    setCbqConsent('grant');
+  });
 }
 
-function sendEvent(data, queue) {
+function sendEvent(data, queue, isConsentRevoked) {
   const eventName = getEventName(data);
   const command = getCommand(eventName);
   const eventData = getEventData(data, eventName);
-  const userData = getUserData(data);
+  const userData = getUserData(data, isConsentRevoked);
   const eventId = data.eventId;
 
   const signalsPixelConfig = getSignalsPixelConfig(data);
@@ -737,7 +785,9 @@ function sendEvent(data, queue) {
     queue('set', 'integrationMethod', partnerName);
   }
 
-  if (isPixelIdNotInitialized || (data.enableAdvancedMatching && !data.runInitOnce)) queue('init', pixelId, userData);
+  if (isPixelIdNotInitialized || (data.enableAdvancedMatching && !data.runInitOnce)) {
+    queue('init', pixelId, userData);
+  }
   queue(command, pixelId, eventName, eventData, eventId ? { eventID: eventId } : undefined);
 }
 
@@ -825,7 +875,7 @@ function getCommand(eventName) {
     : 'trackSingle';
 }
 
-function getUserData(data) {
+function getUserData(data, isConsentRevoked) {
   if (!data.enableAdvancedMatching) {
     return;
   }
@@ -833,7 +883,7 @@ function getUserData(data) {
   let userData = {};
 
   if (data.enableEventEnhancement) {
-    userData = getEventEnhancement();
+    userData = getEventEnhancement(isConsentRevoked);
   }
 
   if (data.enableDataLayerMapping) {
@@ -857,7 +907,7 @@ function getUserData(data) {
   }
 
   if (data.enableEventEnhancement) {
-    storeEventEnhancement(data, userData);
+    storeEventEnhancement(data, userData, isConsentRevoked);
   }
 
   return userData;
@@ -884,14 +934,17 @@ function getEventData(data, eventName) {
   }
 
   if (data.objectPropertiesList && data.objectPropertiesList.length) {
-    objectProperties = mergeObjects(objectProperties, makeTableMap(data.objectPropertiesList, 'name', 'value'));
+    objectProperties = mergeObjects(
+      objectProperties,
+      makeTableMap(data.objectPropertiesList, 'name', 'value')
+    );
   }
 
   return objectProperties;
 }
 
-function getEventEnhancement() {
-  if (localStorage) {
+function getEventEnhancement(isConsentRevoked) {
+  if (!isConsentRevoked && localStorage) {
     const gtmeec = localStorage.getItem('gtmeec-sgw');
     if (gtmeec) {
       const gtmeecParsed = JSON.parse(gtmeec);
@@ -932,9 +985,12 @@ function hashUserDataFields(userData, storeUserDataInLocalStorage) {
       return;
     }
 
-    const normalizedValue = makeString(normalizeBasedOnSchemaKey(fieldName, value)).toLowerCase().trim();
-    if (canUseHashSync) userDataHashed[fieldName] = callInWindow('dataTag256', normalizedValue, 'HEX');
-    else {
+    const normalizedValue = makeString(normalizeBasedOnSchemaKey(fieldName, value))
+      .toLowerCase()
+      .trim();
+    if (canUseHashSync) {
+      userDataHashed[fieldName] = callInWindow('dataTag256', normalizedValue, 'HEX');
+    } else {
       hashAsyncHelpers.pendingHashs++;
       sha256(
         normalizedValue,
@@ -966,8 +1022,8 @@ function storeUserDataInLocalStorage(userData) {
   localStorage.setItem('gtmeec-sgw', gtmeec);
 }
 
-function storeEventEnhancement(data, userData) {
-  if (localStorage && objHasProps(userData)) {
+function storeEventEnhancement(data, userData, isConsentRevoked) {
+  if (!isConsentRevoked && localStorage && objHasProps(userData)) {
     if (!data.storeUserDataHashed) storeUserDataInLocalStorage(userData);
     else hashUserDataFields(userData, storeUserDataInLocalStorage);
   }
@@ -976,7 +1032,9 @@ function storeEventEnhancement(data, userData) {
 function getSignalsPixelConfig(data) {
   const parsedScriptUrl = parseUrl(data.signalsPixelScriptURL);
   const signalsPixelHostFromUrl = parsedScriptUrl.origin + '/';
-  const signalsPixelIdFromUrl = parsedScriptUrl.pathname.split('/').filter((e) => e && e.match('^[1-9][0-9]+'))[0];
+  const signalsPixelIdFromUrl = parsedScriptUrl.pathname
+    .split('/')
+    .filter((e) => e && e.match('^[1-9][0-9]+'))[0];
 
   let signalsPixelHostFromUI;
   if (getType(data.signalsPixelHost) === 'string') {
@@ -1002,80 +1060,122 @@ function sendDataLayerPush(data) {
 }
 
 function parseUserData(userData, userDataFrom, useDL) {
-  let email = userDataFrom.email || userDataFrom.sha256_email_address || userDataFrom.email_address || userDataFrom.em;
+  let email =
+    userDataFrom.email ||
+    userDataFrom.sha256_email_address ||
+    userDataFrom.email_address ||
+    userDataFrom.em;
   const emailType = getType(email);
   if (emailType === 'array' || emailType === 'object') email = email[0];
   if (email) userData.em = email;
 
-  let phone = userDataFrom.phone || userDataFrom.sha256_phone_number || userDataFrom.phone_number || userDataFrom.ph;
+  let phone =
+    userDataFrom.phone ||
+    userDataFrom.sha256_phone_number ||
+    userDataFrom.phone_number ||
+    userDataFrom.ph;
   const phoneType = getType(phone);
   if (phoneType === 'array' || phoneType === 'object') phone = phone[0];
   if (phone) userData.ph = phone;
 
-  if (userDataFrom.firstName) userData.fn = userDataFrom.firstName;
-  else if (userDataFrom.nameFirst) userData.fn = userDataFrom.nameFirst;
-  else if (userDataFrom.first_name) userData.fn = userDataFrom.first_name;
-  else if (userDataFrom.fn) userData.fn = userDataFrom.fn;
-  else if (userDataFrom.address && userDataFrom.address.sha256_first_name)
-    userData.fn = userDataFrom.address.sha256_first_name;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].sha256_first_name)
-    userData.fn = userDataFrom.address[0].sha256_first_name;
-  else if (userDataFrom.address && userDataFrom.address.first_name) userData.fn = userDataFrom.address.first_name;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].first_name)
-    userData.fn = userDataFrom.address[0].first_name;
+  const firstName =
+    userDataFrom.firstName ||
+    userDataFrom.nameFirst ||
+    userDataFrom.first_name ||
+    userDataFrom.fn ||
+    (userDataFrom.address && userDataFrom.address.sha256_first_name
+      ? userDataFrom.address.sha256_first_name
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].sha256_first_name
+      ? userDataFrom.address[0].sha256_first_name
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address.first_name
+      ? userDataFrom.address.first_name
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].first_name
+      ? userDataFrom.address[0].first_name
+      : undefined);
+  if (firstName) userData.fn = firstName;
 
-  if (userDataFrom.lastName) userData.ln = userDataFrom.lastName;
-  else if (userDataFrom.nameLast) userData.ln = userDataFrom.nameLast;
-  else if (userDataFrom.last_name) userData.ln = userDataFrom.last_name;
-  else if (userDataFrom.ln) userData.ln = userDataFrom.ln;
-  else if (userDataFrom.address && userDataFrom.address.sha256_last_name)
-    userData.ln = userDataFrom.address.sha256_last_name;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].sha256_last_name)
-    userData.ln = userDataFrom.address[0].sha256_last_name;
-  else if (userDataFrom.address && userDataFrom.address.last_name) userData.ln = userDataFrom.address.last_name;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].last_name)
-    userData.ln = userDataFrom.address[0].last_name;
+  const lastName =
+    userDataFrom.lastName ||
+    userDataFrom.nameLast ||
+    userDataFrom.last_name ||
+    userDataFrom.ln ||
+    (userDataFrom.address && userDataFrom.address.sha256_last_name
+      ? userDataFrom.address.sha256_last_name
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].sha256_last_name
+      ? userDataFrom.address[0].sha256_last_name
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address.last_name
+      ? userDataFrom.address.last_name
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].last_name
+      ? userDataFrom.address[0].last_name
+      : undefined);
+  if (lastName) userData.ln = lastName;
 
   if (userDataFrom.ge) userData.ge = userDataFrom.ge;
   if (userDataFrom.db) userData.db = userDataFrom.db;
 
-  if (userDataFrom.city) userData.ct = userDataFrom.city;
-  else if (userDataFrom.ct) userData.ct = userDataFrom.ct;
-  else if (userDataFrom.address && userDataFrom.address.city) userData.ct = userDataFrom.address.city;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].city)
-    userData.ct = userDataFrom.address[0].city;
+  const city =
+    userDataFrom.city ||
+    userDataFrom.ct ||
+    (userDataFrom.address && userDataFrom.address.city ? userDataFrom.address.city : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].city
+      ? userDataFrom.address[0].city
+      : undefined);
+  if (city) userData.ct = city;
 
-  if (userDataFrom.state) userData.st = userDataFrom.state;
-  else if (userDataFrom.region) userData.st = userDataFrom.region;
-  else if (userDataFrom.st) userData.st = userDataFrom.st;
-  else if (userDataFrom.address && userDataFrom.address.state) userData.st = userDataFrom.address.state;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].state)
-    userData.st = userDataFrom.address[0].state;
-  else if (userDataFrom.address && userDataFrom.address.region) userData.st = userDataFrom.address.region;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].region)
-    userData.st = userDataFrom.address[0].region;
+  const state =
+    userDataFrom.state ||
+    userDataFrom.region ||
+    userDataFrom.st ||
+    (userDataFrom.address && userDataFrom.address.state ? userDataFrom.address.state : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].state
+      ? userDataFrom.address[0].state
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address.region
+      ? userDataFrom.address.region
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].region
+      ? userDataFrom.address[0].region
+      : undefined);
+  if (state) userData.st = state;
 
-  if (userDataFrom.zip) userData.zp = userDataFrom.zip;
-  else if (userDataFrom.postal_code) userData.zp = userDataFrom.postal_code;
-  else if (userDataFrom.zp) userData.zp = userDataFrom.zp;
-  else if (userDataFrom.address && userDataFrom.address.postal_code) userData.zp = userDataFrom.address.postal_code;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].postal_code)
-    userData.zp = userDataFrom.address[0].postal_code;
-  else if (userDataFrom.address && userDataFrom.address.zip) userData.zp = userDataFrom.address.zip;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].zip)
-    userData.zp = userDataFrom.address[0].zip;
+  const zip =
+    userDataFrom.zip ||
+    userDataFrom.postal_code ||
+    userDataFrom.zp ||
+    (userDataFrom.address && userDataFrom.address.postal_code
+      ? userDataFrom.address.postal_code
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].postal_code
+      ? userDataFrom.address[0].postal_code
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address.zip ? userDataFrom.address.zip : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].zip
+      ? userDataFrom.address[0].zip
+      : undefined);
+  if (zip) userData.zp = zip;
 
-  if (userDataFrom.country) userData.country = userDataFrom.country;
-  else if (userDataFrom.address && userDataFrom.address.country) userData.country = userDataFrom.address.country;
-  else if (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].country)
-    userData.country = userDataFrom.address[0].country;
+  const country =
+    userDataFrom.country ||
+    (userDataFrom.address && userDataFrom.address.country
+      ? userDataFrom.address.country
+      : undefined) ||
+    (userDataFrom.address && userDataFrom.address[0] && userDataFrom.address[0].country
+      ? userDataFrom.address[0].country
+      : undefined);
+  if (country) userData.country = country;
 
-  if (userDataFrom.external_id) userData.external_id = userDataFrom.external_id;
-  else if (userDataFrom.user_id) userData.external_id = userDataFrom.user_id;
-  else if (userDataFrom.userId) userData.external_id = userDataFrom.userId;
-  else if (useDL && getDL('external_id')) userData.external_id = getDL('external_id');
-  else if (useDL && getDL('user_id')) userData.external_id = getDL('user_id');
-  else if (useDL && getDL('userId')) userData.external_id = getDL('userId');
+  const externalId =
+    userDataFrom.external_id ||
+    userDataFrom.user_id ||
+    userDataFrom.userId ||
+    (useDL ? getDL('external_id') || getDL('user_id') || getDL('userId') || undefined : undefined);
+  if (externalId) userData.external_id = externalId;
 
   return userData;
 }
@@ -1091,7 +1191,11 @@ function getUAEventData(eventName, objectProperties, ecommerce) {
   if (eventActionMap[eventName]) {
     const action = eventActionMap[eventName];
 
-    if (ecommerce[action] && ecommerce[action].products && getType(ecommerce[action].products) === 'array') {
+    if (
+      ecommerce[action] &&
+      ecommerce[action].products &&
+      getType(ecommerce[action].products) === 'array'
+    ) {
       objectProperties = {
         content_type: 'product',
         contents: ecommerce[action].products.map((prod) => ({
@@ -1135,7 +1239,9 @@ function getGA4EventData(eventName, objectProperties, ecommerce) {
       if (items[0].item_name) objectProperties.content_name = items[0].item_name;
       if (items[0].item_category) objectProperties.content_category = items[0].item_category;
       if (items[0].price)
-        objectProperties.value = items[0].quantity ? items[0].quantity * items[0].price : items[0].price;
+        objectProperties.value = items[0].quantity
+          ? items[0].quantity * items[0].price
+          : items[0].price;
     }
 
     items.forEach((d) => {
@@ -1190,7 +1296,10 @@ function loadScripts(data) {
       callInWindow(
         'metaSGWScriptLoader',
         data.signalsPixelScriptURL,
-        asyncScriptLoadManager.onScriptLoadSuccess,
+        () => {
+          setCbqConsent('grant'); // It needs to be called to unlock the queue after the SDK loads.
+          asyncScriptLoadManager.onScriptLoadSuccess();
+        },
         asyncScriptLoadManager.onScriptLoadFailure
       );
       asyncScriptLoadManager.onScriptLoadSuccess(); // Must be called after invoking the metaSGWScriptLoader function.
@@ -1221,7 +1330,7 @@ function getAsyncScriptLoadManager(data) {
     maybeFinalize: () => {
       asyncScriptLoadManager.pendingInjectScriptCalls--;
       if (asyncScriptLoadManager.pendingInjectScriptCalls === 0) {
-        return asyncScriptLoadManager.someFailed ? data.gtmOnFailure() : data.gtmOnSuccess();
+        return asyncScriptLoadManager.someFailed ? gtmOnFailure() : gtmOnSuccess();
       }
     }
   };
@@ -1254,7 +1363,7 @@ function isHashed(value) {
 
 function normalizePhoneNumber(phoneNumber) {
   if (!phoneNumber) return phoneNumber;
-  return phoneNumber
+  return makeString(phoneNumber)
     .split('+')
     .join('')
     .split(' ')
@@ -1269,7 +1378,7 @@ function normalizePhoneNumber(phoneNumber) {
 
 function removeWhiteSpace(input) {
   if (!input) return input;
-  return input.split(' ').join('');
+  return makeString(input).split(' ').join('');
 }
 
 
@@ -1840,16 +1949,997 @@ ___WEB_PERMISSIONS___
       "isEditedByUser": true
     },
     "isRequired": true
+  },
+  {
+    "instance": {
+      "key": {
+        "publicId": "access_template_storage",
+        "versionId": "1"
+      },
+      "param": []
+    },
+    "isRequired": true
   }
 ]
 
 
 ___TESTS___
 
-scenarios: []
-setup: ''
+scenarios:
+- name: '[Happy Path] PageView fires init, setHost, integrationMethod, trackSingle
+    and injects scripts sgw script'
+  code: |-
+    runCode(mockData);
+
+    const consentGrants = cbqCalls.filter((c) => c[0] === 'consent' && c[1] === 'grant');
+    assertThat(consentGrants.length).isGreaterThan(0);
+
+    const setHostCalls = cbqCalls.filter((c) => c[0] === 'setHost');
+    assertThat(setHostCalls.length).isEqualTo(1);
+    assertThat(setHostCalls[0][1]).isEqualTo('https://sgw.example.com/');
+
+    const integrationCalls = cbqCalls.filter((c) => c[0] === 'set' && c[1] === 'integrationMethod');
+    assertThat(integrationCalls.length).isEqualTo(1);
+    assertThat(integrationCalls[0][2]).isEqualTo(PARTNER_AGENT_VERSION);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(1);
+    assertThat(initCalls[0][1]).isEqualTo('123456789');
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+    assertThat(trackCalls[0][1]).isEqualTo('123456789');
+    assertThat(trackCalls[0][2]).isEqualTo('PageView');
+
+    assertThat(injectScriptCalls.length).isGreaterThan(0);
+    assertThat(injectScriptCalls[0].url).isEqualTo('https://stapecdn.com/sgw/v1.js');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Pixel Config] Extracts pixel host and ID from signalsPixelScriptURL'
+  code: |-
+    runCode(mockData);
+
+    const setHostCalls = cbqCalls.filter((c) => c[0] === 'setHost');
+    assertThat(setHostCalls.length).isEqualTo(1);
+    assertThat(setHostCalls[0][1]).isEqualTo('https://sgw.example.com/');
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(1);
+    assertThat(initCalls[0][1]).isEqualTo('123456789');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Pixel Config] signalsPixelHost from UI overrides URL-derived host and adds
+    trailing slash'
+  code: |-
+    const testData = assign(assign({}, mockData), { signalsPixelHost: 'https://custom.host.com' });
+
+    runCode(testData);
+
+    const setHostCalls = cbqCalls.filter((c) => c[0] === 'setHost');
+    assertThat(setHostCalls.length).isEqualTo(1);
+    assertThat(setHostCalls[0][1]).isEqualTo('https://custom.host.com/');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Pixel Config] signalsPixelId from UI overrides URL-derived pixel ID'
+  code: |-
+    const testData = assign(assign({}, mockData), { signalsPixelId: '987654321' });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(1);
+    assertThat(initCalls[0][1]).isEqualTo('987654321');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Pixel Init] Already initialized pixel skips re-init, setHost, and integrationMethod'
+  code: |-
+    mock('copyFromWindow', (key) => {
+      if (key === 'cbq') return mockCbq;
+      if (key === '_meta_gtm_signals_gateway_ids') return { '123456789': true };
+      return undefined;
+    });
+
+    runCode(mockData);
+
+    const setHostCalls = cbqCalls.filter((c) => c[0] === 'setHost');
+    assertThat(setHostCalls.length).isEqualTo(0);
+
+    const integrationCalls = cbqCalls.filter((c) => c[0] === 'set' && c[1] === 'integrationMethod');
+    assertThat(integrationCalls.length).isEqualTo(0);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(0);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Name] Maps GA4, stape, and gtm4wp events from DataLayer'
+  code: |-
+    [
+      { dlEvent: 'page_view', expected: 'PageView' },
+      { dlEvent: 'add_to_cart', expected: 'AddToCart' },
+      { dlEvent: 'purchase', expected: 'Purchase' },
+      { dlEvent: 'begin_checkout', expected: 'InitiateCheckout' },
+      { dlEvent: 'view_item', expected: 'ViewContent' },
+      { dlEvent: 'sign_up', expected: 'CompleteRegistration' },
+      { dlEvent: 'generate_lead', expected: 'Lead' },
+      { dlEvent: 'search', expected: 'Search' },
+      { dlEvent: 'add_to_wishlist', expected: 'AddToWishlist' },
+      { dlEvent: 'contact', expected: 'Contact' },
+      { dlEvent: 'subscribe', expected: 'Subscribe' },
+      { dlEvent: 'page_view_stape', expected: 'PageView' },
+      { dlEvent: 'purchase_stape', expected: 'Purchase' },
+      { dlEvent: 'add_to_cart_stape', expected: 'AddToCart' },
+      { dlEvent: 'gtm4wp.orderCompletedEEC', expected: 'Purchase' },
+      { dlEvent: 'gtm4wp.addProductToCartEEC', expected: 'AddToCart' },
+      { dlEvent: 'gtm4wp.productClickEEC', expected: 'ViewContent' }
+    ].forEach((scenario) => {
+      cbqCalls = [];
+      injectScriptCalls = [];
+
+      const testData = assign(assign({}, mockData), { inheritEventName: 'inherit' });
+
+      mock('copyFromDataLayer', (key) => {
+        if (key === 'event') return scenario.dlEvent;
+        return undefined;
+      });
+
+      mock('injectScript', (url, onsuccess) => {
+        injectScriptCalls.push({ url: url });
+        onsuccess();
+      });
+
+      runCode(testData);
+
+      const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle' || c[0] === 'trackSingleCustom');
+      assertThat(trackCalls.length).isEqualTo(1);
+      assertThat(trackCalls[0][2]).isEqualTo(scenario.expected);
+
+      assertApi('gtmOnSuccess').wasCalled();
+      assertApi('gtmOnFailure').wasNotCalled();
+    });
+- name: '[Event Name] Unmapped event from DataLayer passes through as-is'
+  code: |-
+    mockData.inheritEventName = 'inherit';
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'event') return 'my_custom_dl_event';
+      return undefined;
+    });
+
+    runCode(mockData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingleCustom');
+    assertThat(trackCalls.length).isEqualTo(1);
+    assertThat(trackCalls[0][2]).isEqualTo('my_custom_dl_event');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Name] UA ecommerce fallback when no DL event name'
+  code: |-
+    [
+      { ecommerceKey: 'detail', expected: 'ViewContent' },
+      { ecommerceKey: 'add', expected: 'AddToCart' },
+      { ecommerceKey: 'checkout', expected: 'InitiateCheckout' },
+      { ecommerceKey: 'purchase', expected: 'Purchase' }
+    ].forEach((scenario) => {
+      cbqCalls = [];
+      injectScriptCalls = [];
+
+      const testData = assign(assign({}, mockData), { inheritEventName: 'inherit' });
+      const ecommerceData = {};
+      ecommerceData[scenario.ecommerceKey] = true;
+
+      mock('copyFromDataLayer', (key, version) => {
+        if (key === 'event') return undefined;
+        if (key === 'ecommerce' && version === 1) return ecommerceData;
+        return undefined;
+      });
+
+      mock('injectScript', (url, onsuccess) => {
+        injectScriptCalls.push({ url: url });
+        onsuccess();
+      });
+
+      runCode(testData);
+
+      const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+      assertThat(trackCalls.length).isEqualTo(1);
+      assertThat(trackCalls[0][2]).isEqualTo(scenario.expected);
+
+      assertApi('gtmOnSuccess').wasCalled();
+      assertApi('gtmOnFailure').wasNotCalled();
+    });
+- name: '[Event Name] Override with standard and custom event types'
+  code: |-
+    const testData1 = assign(assign({}, mockData), {
+      inheritEventName: 'override',
+      eventName: 'standard',
+      eventNameStandard: 'AddToCart'
+    });
+
+    runCode(testData1);
+
+    let trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+    assertThat(trackCalls[0][2]).isEqualTo('AddToCart');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+
+    cbqCalls = [];
+    injectScriptCalls = [];
+
+    const testData2 = assign(assign({}, mockData), {
+      inheritEventName: 'override',
+      eventName: 'custom',
+      eventNameCustom: 'MyCustomEvent'
+    });
+
+    mock('injectScript', (url, onsuccess) => {
+      injectScriptCalls.push({ url: url });
+      onsuccess();
+    });
+
+    runCode(testData2);
+
+    trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingleCustom');
+    assertThat(trackCalls.length).isEqualTo(1);
+    assertThat(trackCalls[0][2]).isEqualTo('MyCustomEvent');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Advanced Matching] User data from variable and table merged into init'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      userDataFromVariable: { email: 'test@example.com', phone: '1234567890' },
+      userDataList: [{ name: 'fn', value: 'John' }, { name: 'ln', value: 'Doe' }]
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(1);
+
+    const userData = initCalls[0][2];
+    assertThat(userData.em).isEqualTo('test@example.com');
+    assertThat(userData.ph).isEqualTo('1234567890');
+    assertThat(userData.fn).isEqualTo('John');
+    assertThat(userData.ln).isEqualTo('Doe');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Advanced Matching] runInitOnce prevents re-init for initialized pixel'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      runInitOnce: true,
+      userDataFromVariable: { email: 'test@example.com' }
+    });
+
+    mock('copyFromWindow', (key) => {
+      if (key === 'cbq') return mockCbq;
+      if (key === '_meta_gtm_signals_gateway_ids') return { '123456789': true };
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(0);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Advanced Matching] Re-inits initialized pixel when runInitOnce is false'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      runInitOnce: false,
+      userDataFromVariable: { email: 'test@example.com' }
+    });
+
+    mock('copyFromWindow', (key) => {
+      if (key === 'cbq') return mockCbq;
+      if (key === '_meta_gtm_signals_gateway_ids') return { '123456789': true };
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    assertThat(initCalls.length).isEqualTo(1);
+    assertThat(initCalls[0][2].em).isEqualTo('test@example.com');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[User Data] Parses all fields from DataLayer user_data object'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'user_data') return {
+        email: 'dl@example.com',
+        phone: '1555000000',
+        firstName: 'Jane',
+        lastName: 'Smith',
+        city: 'New York',
+        state: 'NY',
+        zip: '10001',
+        country: 'US',
+        external_id: 'ext123',
+        ge: 'f',
+        db: '19900101'
+      };
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    const userData = initCalls[0][2];
+    assertThat(userData.em).isEqualTo('dl@example.com');
+    assertThat(userData.ph).isEqualTo('1555000000');
+    assertThat(userData.fn).isEqualTo('Jane');
+    assertThat(userData.ln).isEqualTo('Smith');
+    assertThat(userData.ct).isEqualTo('New York');
+    assertThat(userData.st).isEqualTo('NY');
+    assertThat(userData.zp).isEqualTo('10001');
+    assertThat(userData.country).isEqualTo('US');
+    assertThat(userData.external_id).isEqualTo('ext123');
+    assertThat(userData.ge).isEqualTo('f');
+    assertThat(userData.db).isEqualTo('19900101');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[User Data] Array email and phone values take the first element'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      userDataFromVariable: {
+        email: ['first@example.com', 'second@example.com'],
+        phone: ['111', '222']
+      }
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    const userData = initCalls[0][2];
+    assertThat(userData.em).isEqualTo('first@example.com');
+    assertThat(userData.ph).isEqualTo('111');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[User Data] Address-nested fields are parsed correctly'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      userDataFromVariable: {
+        address: {
+          first_name: 'Nested',
+          last_name: 'User',
+          city: 'Boston',
+          state: 'MA',
+          postal_code: '02101',
+          country: 'US'
+        }
+      }
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    const userData = initCalls[0][2];
+    assertThat(userData.fn).isEqualTo('Nested');
+    assertThat(userData.ln).isEqualTo('User');
+    assertThat(userData.ct).isEqualTo('Boston');
+    assertThat(userData.st).isEqualTo('MA');
+    assertThat(userData.zp).isEqualTo('02101');
+    assertThat(userData.country).isEqualTo('US');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[User Data] Empty or all-falsy user data returns undefined'
+  code: |-
+    [
+      { description: 'empty object', userData: {} },
+      { description: 'all-falsy values', userData: { email: '', phone: null } }
+    ].forEach((scenario) => {
+      cbqCalls = [];
+      const testData = assign(assign({}, mockData), {
+        enableAdvancedMatching: true,
+        userDataFromVariable: scenario.userData
+      });
+
+      runCode(testData);
+
+      const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+      assertThat(initCalls.length).isEqualTo(1);
+      assertThat(initCalls[0][2]).isUndefined();
+
+      assertApi('gtmOnSuccess').wasCalled();
+      assertApi('gtmOnFailure').wasNotCalled();
+    });
+- name: '[User Data] External ID falls back to DataLayer when useDL is true'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'user_data') return { email: 'test@example.com' };
+      if (key === 'external_id') return 'dl-ext-id';
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    const userData = initCalls[0][2];
+    assertThat(userData.external_id).isEqualTo('dl-ext-id');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Data] GA4 Purchase with multiple items builds correct properties'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      eventNameStandard: 'Purchase',
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'items') return [
+        { item_id: 'SKU1', item_name: 'Product 1', price: 10, quantity: 2, currency: 'EUR' },
+        { item_id: 'SKU2', item_name: 'Product 2', price: 25, quantity: 1 }
+      ];
+      if (key === 'value') return 45;
+      if (key === 'currency') return 'EUR';
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+
+    const eventData = trackCalls[0][3];
+    assertThat(eventData.content_type).isEqualTo('product');
+    assertThat(eventData.content_ids).isEqualTo(['SKU1', 'SKU2']);
+    assertThat(eventData.contents.length).isEqualTo(2);
+    assertThat(eventData.contents[0].id).isEqualTo('SKU1');
+    assertThat(eventData.contents[0].quantity).isEqualTo(2);
+    assertThat(eventData.contents[1].id).isEqualTo('SKU2');
+    assertThat(eventData.contents[1].quantity).isEqualTo(1);
+    assertThat(eventData.value).isEqualTo(45);
+    assertThat(eventData.currency).isEqualTo('EUR');
+    assertThat(eventData.num_items).isDefined();
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Data] GA4 single item includes content_name and content_category'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      eventNameStandard: 'ViewContent',
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'items') return [
+        { item_id: 'SINGLE1', item_name: 'My Product', item_category: 'Electronics', price: 99, quantity: 1 }
+      ];
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    const eventData = trackCalls[0][3];
+    assertThat(eventData.content_name).isEqualTo('My Product');
+    assertThat(eventData.content_category).isEqualTo('Electronics');
+    assertThat(eventData.content_type).isEqualTo('product');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Data] UA Purchase with products builds correct properties'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      eventNameStandard: 'Purchase',
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'ecommerce') return {
+        currencyCode: 'GBP',
+        purchase: {
+          products: [
+            { id: 'P1', price: '15.99', quantity: '3' },
+            { id: 'P2', price: '8.50', quantity: '1' }
+          ]
+        }
+      };
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+
+    const eventData = trackCalls[0][3];
+    assertThat(eventData.content_type).isEqualTo('product');
+    assertThat(eventData.content_ids).isEqualTo(['P1', 'P2']);
+    assertThat(eventData.currency).isEqualTo('GBP');
+    assertThat(eventData.contents.length).isEqualTo(2);
+    assertThat(eventData.num_items).isDefined();
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Data] Properties from variable and table list merge correctly'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      objectPropertiesFromVariable: { content_name: 'My Product', value: 99 },
+      objectPropertiesList: [
+        { name: 'currency', value: 'USD' },
+        { name: 'content_type', value: 'product' }
+      ]
+    });
+
+    runCode(testData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    const eventData = trackCalls[0][3];
+    assertThat(eventData.content_name).isEqualTo('My Product');
+    assertThat(eventData.value).isEqualTo(99);
+    assertThat(eventData.currency).isEqualTo('USD');
+    assertThat(eventData.content_type).isEqualTo('product');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Data] GA4 Search event includes search_string'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      eventNameStandard: 'Search',
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', (key) => {
+      if (key === 'search_term') return 'blue shoes';
+      return undefined;
+    });
+
+    runCode(testData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    const eventData = trackCalls[0][3];
+    assertThat(eventData.search_string).isEqualTo('blue shoes');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Data] GA4 Purchase defaults currency to USD and value to 0'
+  code: |-
+    const testData = assign(assign({}, mockData), {
+      eventNameStandard: 'Purchase',
+      enableDataLayerMapping: true
+    });
+
+    mock('copyFromDataLayer', () => undefined);
+
+    runCode(testData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    const eventData = trackCalls[0][3];
+    assertThat(eventData.currency).isEqualTo('USD');
+    assertThat(eventData.value).isEqualTo(0);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[DataLayer Push] Pushes event with custom and default settings'
+  code: |-
+    [
+      {
+        desc: 'custom name and layer',
+        dataLayerEventName: 'sgw_pageview',
+        dataLayerVariableName: 'myDataLayer',
+        eventId: 'evt-123',
+        expectedLayer: 'myDataLayer',
+        expectedEvent: 'sgw_pageview'
+      },
+      {
+        desc: 'defaults when not specified',
+        dataLayerEventName: undefined,
+        dataLayerVariableName: undefined,
+        eventId: 'evt-456',
+        expectedLayer: 'dataLayer',
+        expectedEvent: 'DefaultTagEvent'
+      }
+    ].forEach((scenario) => {
+      createQueueItems = [];
+      const testData = assign(assign({}, mockData), {
+        dataLayerEventPush: true,
+        dataLayerEventName: scenario.dataLayerEventName,
+        dataLayerVariableName: scenario.dataLayerVariableName,
+        eventId: scenario.eventId
+      });
+
+      runCode(testData);
+
+      const dlPushes = createQueueItems.filter((c) => c[0] === scenario.expectedLayer);
+      assertThat(dlPushes.length).isEqualTo(1);
+      assertThat(dlPushes[0][1].event).isEqualTo(scenario.expectedEvent);
+      assertThat(dlPushes[0][1].eventId).isEqualTo(scenario.eventId);
+
+      assertApi('gtmOnSuccess').wasCalled();
+      assertApi('gtmOnFailure').wasNotCalled();
+    });
+- name: '[Scripts] sgw script failure calls gtmOnFailure'
+  code: |-
+    mock('injectScript', (url, onsuccess, onfailure) => {
+      if (url === 'https://stapecdn.com/sgw/v1.js') {
+        onfailure();
+      }
+    });
+
+    runCode(mockData);
+
+    assertApi('gtmOnSuccess').wasNotCalled();
+    assertApi('gtmOnFailure').wasCalled();
+- name: '[Event Enhancement] Reads stored data from localStorage and writes back after
+    merge'
+  code: |-
+    localStorageData['gtmeec-sgw'] = '{"em":"stored@example.com"}';
+
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      enableEventEnhancement: true,
+      userDataFromVariable: { ph: '1999999999' }
+    });
+
+    runCode(testData);
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    const userData = initCalls[0][2];
+    assertThat(userData.em).isEqualTo('stored@example.com');
+    assertThat(userData.ph).isEqualTo('1999999999');
+
+    assertThat(localStorageData['gtmeec-sgw']).isDefined();
+    const stored = JSON.parse(localStorageData['gtmeec-sgw']);
+    assertThat(stored.em).isEqualTo('stored@example.com');
+    assertThat(stored.ph).isEqualTo('1999999999');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Enhancement] Hashed storage calls hashUserDataFields with sync hash'
+  code: |-
+    mock('copyFromWindow', (key) => {
+      if (key === 'cbq') return mockCbq;
+      if (key === 'dataTag256') return function() { return 'abc123hash'; };
+      return undefined;
+    });
+
+    mock('callInWindow', function() {
+      const name = arguments[0];
+      if (name === 'metaSGWScriptLoader') {
+        const successCallback = arguments[2];
+        if (successCallback) successCallback();
+      }
+      if (name === 'dataTag256') return 'abc123hash';
+    });
+
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      enableEventEnhancement: true,
+      storeUserDataHashed: true,
+      userDataFromVariable: { email: 'test@example.com' }
+    });
+
+    runCode(testData);
+
+    assertThat(localStorageData['gtmeec-sgw']).isDefined();
+    const stored = JSON.parse(localStorageData['gtmeec-sgw']);
+    assertThat(stored.em).isEqualTo('abc123hash');
+
+    assertApi('callInWindow').wasCalledWith('dataTag256', 'test@example.com', 'HEX');
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Enhancement] Hashed storage with async sha256 stores hashed data'
+  code: |-
+    mock('sha256', (input, successCb, errorCb, options) => {
+      successCb('async_hashed_' + input);
+    });
+
+    const testData = assign(assign({}, mockData), {
+      enableAdvancedMatching: true,
+      enableEventEnhancement: true,
+      storeUserDataHashed: true,
+      userDataFromVariable: { email: 'test@example.com' }
+    });
+
+    runCode(testData);
+
+    assertThat(localStorageData['gtmeec-sgw']).isDefined();
+    const stored = JSON.parse(localStorageData['gtmeec-sgw']);
+    assertThat(stored.em).isEqualTo('async_hashed_test@example.com');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event ID] Passes eventID option in track call'
+  code: |-
+    mockData.eventId = 'evt-abc-123';
+
+    runCode(mockData);
+
+    const trackCalls = cbqCalls.filter((c) => c[0] === 'trackSingle');
+    assertThat(trackCalls.length).isEqualTo(1);
+    assertThat(trackCalls[0][4]).isEqualTo({ eventID: 'evt-abc-123' });
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[DL Version] enableCurrentDataLayerOnly uses DL version 1'
+  code: |-
+    let capturedVersion;
+    mock('copyFromDataLayer', (key, version) => {
+      if (key === 'search_term') {
+        capturedVersion = version;
+        return 'test query';
+      }
+      return undefined;
+    });
+
+    const testData = assign(assign({}, mockData), {
+      enableDataLayerMapping: true,
+      enableCurrentDataLayerOnly: true,
+      eventNameStandard: 'Search'
+    });
+
+    runCode(testData);
+
+    assertThat(capturedVersion).isEqualTo(1);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Consent] Manual consent=false revokes cbq and calls gtmOnSuccess without
+    scripts'
+  code: |-
+    mockData.consent = false;
+
+    runCode(mockData);
+
+    const revokeCalls = cbqCalls.filter((c) => c[0] === 'consent' && c[1] === 'revoke');
+    assertThat(revokeCalls.length).isEqualTo(1);
+
+    const grantCalls = cbqCalls.filter((c) => c[0] === 'consent' && c[1] === 'grant');
+    assertThat(grantCalls.length).isEqualTo(0);
+
+    assertThat(injectScriptCalls.length).isEqualTo(0);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Consent] GTM consent mode denied revokes and calls gtmOnSuccess without
+    scripts'
+  code: |-
+    mockData.enableConsentMode = true;
+    mock('isConsentGranted', () => false);
+
+    runCode(mockData);
+
+    const revokeCalls = cbqCalls.filter((c) => c[0] === 'consent' && c[1] === 'revoke');
+    assertThat(revokeCalls.length).isEqualTo(1);
+
+    assertThat(injectScriptCalls.length).isEqualTo(0);
+
+    assertApi('addConsentListener').wasCalled();
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Consent] Listener fires queued callbacks when consent is later granted'
+  code: |-
+    mockData.enableConsentMode = true;
+    mock('isConsentGranted', () => false);
+
+    let consentListenerCallback;
+    mock('addConsentListener', (type, callback) => {
+      consentListenerCallback = callback;
+    });
+
+    runCode(mockData);
+
+    assertThat(injectScriptCalls.length).isEqualTo(0);
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+
+    consentListenerCallback('ad_storage', true);
+
+    assertThat(injectScriptCalls.length).isGreaterThan(0);
+    assertThat(injectScriptCalls[0].url).isEqualTo('https://stapecdn.com/sgw/v1.js');
+
+    const grantCalls = cbqCalls.filter((c) => c[0] === 'consent' && c[1] === 'grant');
+    assertThat(grantCalls.length).isGreaterThan(0);
+- name: '[Consent] setCbqConsent skips duplicate revoke when one is already queued'
+  code: |-
+    const mockCbqWithQueue = function() {
+      const args = [];
+      for (let i = 0; i < arguments.length; i++) {
+        args.push(arguments[i]);
+      }
+      cbqCalls.push(args);
+    };
+    mockCbqWithQueue.queue = [['consent', 'revoke']];
+
+    mock('copyFromWindow', (key) => {
+      if (key === 'cbq') return mockCbqWithQueue;
+      return undefined;
+    });
+
+    mockData.consent = false;
+
+    runCode(mockData);
+
+    const revokeCalls = cbqCalls.filter((c) => c[0] === 'consent' && c[1] === 'revoke');
+    assertThat(revokeCalls.length).isEqualTo(0);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Consent] LDU sets dataProcessingOptions with country and state'
+  code: |-
+    mockData.dpoLDU = true;
+    mockData.dpoCountry = '1';
+    mockData.dpoState = '1000';
+
+    runCode(mockData);
+
+    const dpoCalls = cbqCalls.filter((c) => c[0] === 'dataProcessingOptions');
+    assertThat(dpoCalls.length).isEqualTo(1);
+    assertThat(dpoCalls[0][1]).isEqualTo(['LDU']);
+    assertThat(dpoCalls[0][2]).isEqualTo(1);
+    assertThat(dpoCalls[0][3]).isEqualTo(1000);
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+- name: '[Event Enhancement] Skips localStorage read and write when consent is revoked'
+  code: |-
+    let getItemCalled = false;
+    let setItemCalled = false;
+    mockObject('localStorage', {
+      getItem: (key) => { getItemCalled = true; return localStorageData[key]; },
+      setItem: (key, value) => { setItemCalled = true; localStorageData[key] = value; }
+    });
+
+    localStorageData['gtmeec-sgw'] = '{"em":"stored@example.com"}';
+
+    const testData = assign(assign({}, mockData), {
+      consent: false,
+      enableAdvancedMatching: true,
+      enableEventEnhancement: true,
+      userDataFromVariable: { ph: '1999999999' }
+    });
+
+    runCode(testData);
+
+    assertThat(getItemCalled).isFalse();
+    assertThat(setItemCalled).isFalse();
+
+    const initCalls = cbqCalls.filter((c) => c[0] === 'init');
+    const userData = initCalls[0][2];
+    assertThat(userData.em).isUndefined();
+    assertThat(userData.ph).isEqualTo('1999999999');
+
+    assertApi('gtmOnSuccess').wasCalled();
+    assertApi('gtmOnFailure').wasNotCalled();
+setup: |-
+  const JSON = require('JSON');
+  const Object = require('Object');
+
+  const PARTNER_AGENT_VERSION = 'stape-gtm-1.0.2-sgw';
+
+  const assign = (target, source) => {
+    if (!source) return target;
+    Object.keys(source).forEach((key) => { target[key] = source[key]; });
+    return target;
+  };
+
+  let cbqCalls = [];
+  const mockCbq = function() {
+    const args = [];
+    for (let i = 0; i < arguments.length; i++) {
+      args.push(arguments[i]);
+    }
+    cbqCalls.push(args);
+  };
+  mockCbq.queue = [];
+
+  let setInWindowCalls = [];
+  mock('setInWindow', (key, value, override) => {
+    setInWindowCalls.push([key, value, override]);
+  });
+
+  let injectScriptCalls = [];
+  mock('injectScript', (url, onsuccess, onfailure, cacheToken) => {
+    injectScriptCalls.push({ url: url, onsuccess: onsuccess, onfailure: onfailure, cacheToken: cacheToken });
+    onsuccess();
+  });
+
+  mock('copyFromWindow', (key) => {
+    if (key === 'cbq') return mockCbq;
+    return undefined;
+  });
+
+  mock('aliasInWindow', () => true);
+
+  let createQueueItems = [];
+  mock('createQueue', (name) => {
+    return (item) => { createQueueItems.push([name, item]); };
+  });
+
+  mock('copyFromDataLayer', () => undefined);
+  mock('isConsentGranted', () => true);
+  mock('addConsentListener', () => {});
+
+  mock('callInWindow', function() {
+    const name = arguments[0];
+    if (name === 'metaSGWScriptLoader') {
+      // Simulate the Signals Gateway script loader calling back on success.
+      const successCallback = arguments[2];
+      if (successCallback) successCallback();
+    }
+  });
+
+  let templateStorageData = {};
+  mockObject('templateStorage', {
+    getItem: (key) => templateStorageData[key],
+    setItem: (key, value) => { templateStorageData[key] = value; }
+  });
+
+  let localStorageData = {};
+  mockObject('localStorage', {
+    getItem: (key) => localStorageData[key],
+    setItem: (key, value) => { localStorageData[key] = value; }
+  });
+
+  mock('parseUrl', (url) => {
+    return { origin: 'https://sgw.example.com', pathname: '/sdk/123456789/events.js' };
+  });
+
+  mock('sha256', () => {});
+
+  const mockData = {
+    signalsPixelScriptURL: 'https://sgw.example.com/sdk/123456789/events.js',
+    consent: true,
+    enableConsentMode: false,
+    inheritEventName: 'override',
+    eventName: 'standard',
+    eventNameStandard: 'PageView',
+    enableDataLayerMapping: false,
+    enableAdvancedMatching: false,
+    dpoLDU: false,
+    dataLayerEventPush: false,
+    enableEventEnhancement: false,
+    storeUserDataHashed: false,
+    runInitOnce: false,
+    enableCurrentDataLayerOnly: false
+  };
 
 
 ___NOTES___
 
+2026-06-10 - Change Notes:
+  - Port consent improvements from fb-tag-web: deferred script loading, single listener registration per page, duplicate revoke guard, and gtmOnSuccess() on consent denial to prevent "Still running" GTM status
+  - Thread isConsentRevoked through sendEvent, getUserData, getEventEnhancement, and storeEventEnhancement so user data is never read from or written to storage when consent is denied
+  - Apply makeString() before normalization in phone and whitespace helpers to prevent errors on non-string inputs
+  - Add 30 unit test scenarios covering Happy Path, Pixel Config, Event Name, Advanced Matching, User Data, Event Data, DataLayer Push, Scripts, Event Enhancement, Event ID, and DL Version
+  - Bump version to stape-gtm-1.0.2-sgw
+
 Created on 12/09/2025, 12:01:33 PM
+
